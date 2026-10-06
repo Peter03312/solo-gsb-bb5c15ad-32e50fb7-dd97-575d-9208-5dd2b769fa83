@@ -36,6 +36,15 @@
   排序；只读，不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、
   重复陶片对、跨版本或无效编号时整次拒绝并指出字段。间隙为 0 表示接触，
   负值（-1）仅标识内部重叠，不得当作可用间隙（详见 gaps.py）。
+- 离线工作站迁移（/api/transfer/export|import/preview|import/confirm）：
+  把当前装配及全部不可改版本快照导出为带格式版本号（format.version=1.0）
+  的 JSON 包；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配，
+  不写库；确认携带目标库当前装配版本，在单一事务中保留碎片与关系原 ID、
+  轮廓、位姿、标记、状态、时间戳及各快照原版本号（不新增版本、不产生新
+  快照）。目标库仅允许存在空白基线，不得有用户碎片或关系；格式版本不
+  支持、轮廓无效、关系引用缺失、快照版本重复或末版与包内当前装配不一致
+  时整包拒绝并指出原因；目标版本过期也拒绝，库与历史保持原状
+  （详见 transfer.py）。
 """
 from __future__ import annotations
 
@@ -45,13 +54,15 @@ from contextlib import asynccontextmanager
 from typing import Literal, Union
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, gaps, geometry, history, revision, trial
+from . import calibration, gaps, geometry, history, revision, transfer, trial
 from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
 from .revision import RevisionError, evaluate_revision
+from .transfer import TransferError, build_package
 from .trial import TrialError, evaluate_proposal
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -146,6 +157,15 @@ class GapPairIn(BaseModel):
 class GapsIn(BaseModel):
     # 非空陶片对列表；空列表整次拒绝（400 empty_pairs）
     pairs: list[GapPairIn] = Field(default_factory=list)
+
+
+class TransferImportIn(BaseModel):
+    # 迁移包整体（带格式名/格式版本号、当前装配、全部快照）。包结构由
+    # transfer.validate_package 自行做整包校验并逐字段指出原因（400），
+    # 这里不设 Pydantic 模型，避免结构不合法时只得到笼统的 422。
+    package: dict
+    # 导入预览所依据的目标库当前装配版本；过期则 409，库与历史保持原状
+    expected_version: int | None = None
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -829,6 +849,76 @@ def confirm_restore(version: int, payload: RestoreIn):
         "version": new_version,
         "assembly": restored,
     }
+
+
+# ---------------------------------------------------------------- 离线工作站迁移
+
+@app.get("/api/transfer/export")
+def export_package():
+    """导出迁移包：当前装配 + 全部不可改版本快照（带格式版本号）。
+
+    只读。返回带 Content-Disposition 的 JSON 文件（按当前版本号命名），
+    包内碎片/关系保留原 ID、轮廓、位姿、标记、状态与全部时间戳，快照保留
+    原版本号、来源、状态与原固化时间。
+    """
+    d = get_db()
+    with d.lock:
+        pkg = build_package(d)
+    filename = f"pottery-assembly-v{pkg['assembly']['version']}.json"
+    return JSONResponse(
+        pkg,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.post("/api/transfer/import/preview")
+def preview_import(payload: TransferImportIn):
+    """导入预览：整包校验并演算导入后的完整装配，不写库。
+
+    返回包内碎片、有效及已撤销关系、版本数（含每版来源/时间）与导入后装配
+    （按有效关系重算连通组），以及目标库空白状态。格式版本不支持、包结构
+    不合法、轮廓无效、关系引用缺失、快照版本重复、末版与包内当前装配不
+    一致 → 400 package_rejected（errors 逐条指出）；目标库存在用户碎片或
+    关系 → 400 target_not_blank。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            return transfer.build_import_preview(d, payload.package)
+        except TransferError as e:
+            raise HTTPException(e.status, e.detail())
+
+
+@app.post("/api/transfer/import/confirm", status_code=201)
+def confirm_import(payload: TransferImportIn):
+    """确认导入：在锁与单一事务内整体替换空白目标库。
+
+    保留碎片与关系原 ID、轮廓、位姿、标记、active/created_at/undone_at 及
+    各快照原版本号/来源/时间戳；当前版本沿用包内版本，不新增版本、不产生
+    新快照；空白基线由导入包替换。整包校验失败 / 目标库非空白 → 400，
+    expected_version 与目标库当前版本不符 → 409，库与历史保持原状。
+    """
+    d = get_db()
+    if payload.expected_version is None:
+        raise HTTPException(400, detail={
+            "message": "确认导入必须携带目标库当前装配版本 expected_version",
+            "code": "expected_version_required",
+        })
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = transfer.commit_import(
+                    d, payload.expected_version, payload.package)
+            except TransferError as e:
+                raise HTTPException(e.status, e.detail())
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次导入未生效")
+    return result
 
 
 # ---------------------------------------------------------------- 前端静态页

@@ -57,6 +57,17 @@
   （404）均拒绝且不写入；成功后原子恢复该版碎片与关系的**原 ID 及状态**
   （含 active / undone_at / created_at、轮廓、标记、位姿），重算连通组，
   装配版本只 +1 并留下新的 `restore` 快照，旧快照全部保留仍可查。
+- **离线工作站迁移**：修复师更换离线工作站时，可把**当前装配及全部不可改
+  版本快照**导出为带格式版本号（`format.version = "1.0"`）的 JSON 包，再在
+  另一台**空白工作站**导入。导入先**预览**包内碎片、有效及已撤销关系、版本
+  数与导入后的完整装配（不写库）；确认须携带**目标库当前装配版本**，在
+  **单一事务**中保留碎片与关系的原 ID、轮廓、位姿、标记、状态、时间戳及各
+  快照的原版本号/来源/原固化时间（不新增版本、不产生新快照）。目标库仅
+  允许存在空白基线，**不得有用户碎片或关系**，该基线可由导入包替换。
+  格式版本不支持、轮廓无效、关系引用缺失、快照版本重复、快照状态版本不
+  一致或末版快照与包内当前装配不一致时**整包拒绝并逐条指出原因**；目标
+  版本过期也拒绝，库与历史保持原状。导入后历史查看、恢复及继续拼接均可
+  正常使用。
 
 ## 一键启动（Docker Compose）
 
@@ -84,7 +95,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_PATH` | `data/app.db`（容器内 `/app/data/app.db`） | SQLite 数据库文件路径 |
-| `SEED_DEMO_DATA` | `1` | 首次启动且库为空时写入 4 片演示陶片；设为 `0` 关闭 |
+| `SEED_DEMO_DATA` | `1` | 首次启动且库为空时写入 4 片演示陶片；设为 `0` 关闭（**离线迁移的目标空白工作站建议设为 `0`**，存在演示碎片的库不可导入） |
 
 Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 
@@ -145,6 +156,20 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
    - 不满足任一条件（误差未严格下降 / 仍有超限 / 产生轮廓重叠）则说明原因、
      保持现状；预览依据版本过期时按钮禁用，重新预览后再确认；校准前后两个
      版本都会出现在底部「历史版本」列表，可查看或恢复。
+10. **离线工作站迁移**（导出 → 预览 → 确认）：
+    - 在「查看装配」页底部「**离线工作站迁移**」点「**导出当前装配 JSON
+      包**」，浏览器下载 `pottery-assembly-vN.json`（当前装配 + 全部不可改
+      快照，格式 v1.0），用 U 盘等拷到新工作站；
+    - 在**空白工作站**点「**选择迁移包并预览…**」：侧栏列出包内碎片、有效/
+      已撤销关系、快照版本数（含来源与原固化时间），主画布以**蓝色**展示
+      导入后的完整装配（按有效关系重算连通组），此时**不写库**；
+    - 核对无误后点「**确认导入**」：自动携带目标库当前版本，在单一事务内
+      整体替换空白基线，原 ID/轮廓/位姿/标记/状态/时间戳及各快照原版本号
+      全部保留，不新增版本；
+    - 格式版本不支持、轮廓无效、关系引用缺失、快照版本重复、末版与包内
+      当前装配不一致、目标库非空白时整包拒绝，侧栏逐条列出原因；预览依据
+      的目标版本过期时确认按钮禁用，重新选择迁移包预览即可；
+    - 导入成功后即可正常进行历史查看/恢复与继续拼接等全部操作。
 
 ## API 概览
 
@@ -169,6 +194,9 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 | `POST` | `/api/fragments/{id}/revision/confirm` | 轮廓修订确认（重新校验同一输入，原子更新，版本只 +1） |
 | `POST` | `/api/calibration/preview` | 锚点整体校准预览（调整前后位姿/逐关系误差/轮廓冲突，不落库） |
 | `POST` | `/api/calibration/confirm` | 锚点整体校准确认（重算校验，原子更新位姿与关系误差，版本只 +1） |
+| `GET` | `/api/transfer/export` | 导出迁移包（当前装配 + 全部不可改快照，格式 v1.0，JSON 文件下载） |
+| `POST` | `/api/transfer/import/preview` | 导入预览：整包校验 + 包内碎片/有效及已撤销关系/版本数/导入后装配（不写库） |
+| `POST` | `/api/transfer/import/confirm` | 确认导入（携带目标库当前版本，单一事务整体替换空白基线，版本沿用包内） |
 
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法 / 目标
@@ -178,7 +206,10 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 `detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
 **间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**的期望版本
-过期），`422` 请求体结构不合法。
+过期、**导入确认的目标库版本过期**），`422` 请求体结构不合法。导入预览/
+确认的整包拒绝另在 `detail.errors[]` 逐条给出字段位置与原因
+（如 `snapshots[2].state.fragments[0].contour`）；目标库非空白为
+`400 target_not_blank`（`detail.target` 给出当前版本与碎片/关系数）。
 
 ## 有序试拼 API
 
@@ -661,21 +692,174 @@ curl -X POST http://localhost:8000/api/assembly/versions/2/gaps \
 #   {"field":"pairs[3].version","code":"cross_version", ...}]}}
 ```
 
+## 离线工作站迁移 API
+
+修复师更换离线工作站时的整体搬迁：**当前装配 + 全部不可改版本快照**打成
+一个带格式版本号的 JSON 包，在另一台空白工作站上「先预览、再确认」导入。
+
+- 迁移包格式：`format.name = "pottery-assembly-transfer"`、
+  `format.version = "1.0"`（当前仅支持 `1.0`，其它版本整包拒绝）；
+- 包内保留碎片/关系的**原 ID**、轮廓、位姿 (x/y/theta)、两侧标记、
+  `max_error`、`active` / `created_at` / `undone_at`，以及每个快照的
+  **原版本号**、来源、状态与**原固化时间戳**；
+- 导入**不新增装配版本、不产生新快照**：当前版本沿用包内当前装配版本号，
+  目标库的空白基线由包内快照整体替换；
+- 导入后历史查看、版本恢复、继续拼接/撤销/修订/校准、间隙查询全部沿用，
+  新碎片/关系的自增 id 从包内最大 id 继续（不复用已删除 id）。
+
+**目标库前提**：仅允许存在空白基线（`fragments` / `relations` 均为空，
+通常是新工作站以 `SEED_DEMO_DATA=0` 首次启动后 v0 基线状态）；存在任何
+用户碎片或关系即 `400 target_not_blank` 拒绝，不写入。
+
+### 导出（只读）
+
+```bash
+curl -OJ http://localhost:8000/api/transfer/export
+# 保存为 pottery-assembly-v3.json（按当前装配版本号命名）
+```
+
+响应为带 `Content-Disposition: attachment; filename="pottery-assembly-vN.json"`
+的 JSON 文件：
+
+```jsonc
+{
+  "format": { "name": "pottery-assembly-transfer", "version": "1.0" },
+  "exported_at": "2026-10-06T09:12:00+00:00",
+  "assembly": {                       // 当前装配（与 GET /api/assembly 同结构）
+    "version": 3,
+    "fragments": [ { "id": 1, "name": "陶片A-左半", "contour": [[0,0], "…"],
+                     "x": 0, "y": 0, "theta": 0, "group_id": null,
+                     "created_at": "…" } ],
+    "groups": [],
+    "relations": [ { "id": 1, "fragment_a": 1, "fragment_b": 2,
+                     "markers_a": ["…"], "markers_b": ["…"], "max_error": 0.0,
+                     "active": false, "created_at": "…", "undone_at": "…" } ]
+  },
+  "snapshots": [                      // 全部不可改快照（版本升序、原时间戳）
+    { "version": 1, "source": "baseline", "state": { "…": "该版完整装配" },
+      "created_at": "2026-10-06T08:00:00+00:00" },
+    { "version": 2, "source": "accept",   "state": { "…": "…" }, "created_at": "…" },
+    { "version": 3, "source": "undo",     "state": { "…": "…" }, "created_at": "…" }
+  ]
+}
+```
+
+### 导入预览（不落库）
+
+把整个迁移包放在请求体 `package` 字段中：
+
+```bash
+curl -X POST http://localhost:8000/api/transfer/import/preview \
+  -H 'Content-Type: application/json' \
+  -d "{\"package\": $(cat pottery-assembly-v3.json)}"
+```
+
+成功 `200`（只读，不写库）：
+
+```jsonc
+{
+  "ok": true,
+  "format_version": "1.0",
+  "exported_at": "2026-10-06T09:12:00+00:00",
+  "package": {
+    "current_version": 3,
+    "fragment_count": 4, "relation_count": 1,
+    "active_relation_count": 0, "undone_relation_count": 1,
+    "snapshot_count": 3,
+    "versions": [ { "version": 1, "source": "baseline",
+                    "source_label": "基线（启用版本历史时记录）", "created_at": "…" },
+                  "…" ],
+    "fragments": [ { "id": 1, "name": "陶片A-左半", "contour_vertices": 7 }, "…" ],
+    "relations": [ { "id": 1, "fragment_a": 1, "fragment_b": 2, "active": false,
+                     "created_at": "…", "undone_at": "…" } ]
+  },
+  "target": { "current_version": 0, "blank": true,
+              "fragment_count": 0, "relation_count": 0 },
+  "imported_assembly": { "version": 3, "fragments": ["…"], "groups": [],
+                         "relations": ["…"] }   // 按有效关系重算连通组
+}
+```
+
+### 确认导入（单一事务，版本沿用包内）
+
+请求体在预览基础上增加 `expected_version`——**目标库当前装配版本**
+（预览返回的 `target.current_version`）：
+
+```bash
+curl -X POST http://localhost:8000/api/transfer/import/confirm \
+  -H 'Content-Type: application/json' \
+  -d "{\"expected_version\": 0, \"package\": $(cat pottery-assembly-v3.json)}"
+# 201:
+# {"ok":true,"imported_version":3,"expected_version":0,"snapshot_count":3,
+#  "fragment_count":4,"relation_count":1,"assembly":{ "version":3, "…": "…" }}
+```
+
+- 在锁与**单一事务**内整体替换：碎片与关系原 ID/轮廓/位姿/标记/
+  `active`/`created_at`/`undone_at` 原样写回，按有效关系重算连通组，快照
+  表替换为包内快照（原版本号/来源/原固化时间戳），当前版本设为包内当前
+  装配版本——**不新增版本、不产生新快照**；空白基线即被包内基线替换；
+- 任一校验失败 / 目标库非空白 → `400`，事务回滚，库与历史保持原状；
+- `expected_version` 与目标库当前版本不符 → `409 version_conflict`，
+  同样不写入；缺少 `expected_version` → `400 expected_version_required`。
+
+### 整包拒绝（逐条指出，不写入）
+
+`400 {"detail":{"code":"package_rejected","errors":[
+{"field","code","message"}, …]}}`，`errors[]` 一次性列出全部问题：
+
+| code | 含义 | 典型 field |
+| --- | --- | --- |
+| `unsupported_format` | 格式名不是 `pottery-assembly-transfer` | `format.name` |
+| `format_version_unsupported` | 格式版本不在支持范围（仅 `1.0`） | `format.version` |
+| `invalid_contour` | 碎片轮廓无效（自交/不足 3 顶点/面积为零） | `assembly.fragments[0].contour`、`snapshots[2].state.fragments[0].contour` |
+| `relation_reference_missing` | 关系引用了状态内不存在的碎片 | `assembly.relations[0].fragment_b` |
+| `snapshot_version_duplicate` | 快照版本号重复 | `snapshots[3].version` |
+| `snapshot_state_version_mismatch` | 快照版本与其 state.version 不一致 | `snapshots[i]` |
+| `invalid_snapshot_version` / `empty_snapshots` | 快照版本非法 / 快照列表为空 | `snapshots` |
+| `last_snapshot_mismatch` | 末版快照与包内当前装配不一致（版本号或碎片/关系内容） | `snapshots` |
+
+此外：当前装配与每个快照状态中的碎片 id 重复、关系 id 重复、字段类型不
+合法也会逐条列出（`duplicate_fragment_id` / `invalid_relation_id` /
+`invalid_pose` / `invalid_markers` / `marker_count_mismatch` /
+`invalid_max_error` / `invalid_active` / `invalid_created_at` /
+`invalid_undone_at` / `invalid_snapshot_source` /
+`invalid_snapshot_created_at` 等）；请求体 `package` 不是 JSON 对象 →
+`422`。
+
+### 端到端示例（A 机导出 → B 机导入）
+
+```bash
+# A 机（已有装配，当前 v3）：导出
+curl -OJ http://机器A:8000/api/transfer/export     # pottery-assembly-v3.json
+
+# B 机（全新空白工作站，SEED_DEMO_DATA=0，当前 v0）：先预览
+curl -X POST http://机器B:8000/api/transfer/import/preview \
+  -H 'Content-Type: application/json' \
+  --data-binary @<(jq '{package: .}' pottery-assembly-v3.json)
+
+# 核对碎片/关系/版本数/导入后装配无误后确认（携带 B 机当前版本 0）
+curl -X POST http://机器B:8000/api/transfer/import/confirm \
+  -H 'Content-Type: application/json' \
+  --data-binary @<(jq '{expected_version: 0, package: .}' pottery-assembly-v3.json)
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/离线迁移端点
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
   gaps.py          # 陶片对间隙查询：版本快照上的边界最短间隙/最近点/重叠演算（只读）
+  transfer.py      # 离线工作站迁移：带格式版本号 JSON 包的导出构建、整包校验、导入预览/确认
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、连通组重算、不可改版本快照、按版恢复
   static/          # 浏览器二维画布前端（原生 JS）
 tests/
   test_gaps.py     # 陶片对间隙查询 API 测试
+  test_transfer.py # 离线工作站迁移（导出/预览/确认/整包拒绝/导入后历史可用）测试
 Dockerfile
 docker-compose.yml
 requirements.txt

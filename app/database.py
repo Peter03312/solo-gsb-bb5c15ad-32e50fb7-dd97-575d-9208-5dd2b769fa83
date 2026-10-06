@@ -84,6 +84,12 @@ class DB:
             "UPDATE meta SET value = ? WHERE key = 'version'", (str(v),))
         return v
 
+    def set_version(self, v: int):
+        """显式设置当前装配版本（仅离线工作站导入迁移包时使用：版本沿用
+        包内当前装配版本号，不递增）。"""
+        self.conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'version'", (str(v),))
+
     # ------------------------------------------------------------ 行转换
 
     @staticmethod
@@ -279,6 +285,41 @@ class DB:
             " ORDER BY version DESC").fetchall()
         return [{"version": r["version"], "source": r["source"],
                  "created_at": r["created_at"]} for r in rows]
+
+    def all_snapshots(self) -> list[dict]:
+        """全部不可改快照（含原版本号、来源、状态与原快照时间戳），按版本升序。
+
+        供离线工作站导出迁移包使用：快照一经导入即按原版本号与原时间戳保留。
+        """
+        rows = self.conn.execute(
+            "SELECT version, source, state, created_at FROM snapshots"
+            " ORDER BY version ASC").fetchall()
+        return [{"version": r["version"], "source": r["source"],
+                 "state": json.loads(r["state"]),
+                 "created_at": r["created_at"]} for r in rows]
+
+    def save_snapshot_at(self, version: int, source: str, state: dict,
+                         created_at: str):
+        """按显式版本号与显式快照时间戳写入快照（仅导入迁移包时使用）。
+
+        保留各快照的原版本号与原固化时间；调用前快照表已被整体清空，
+        因此直接 INSERT。
+        """
+        self.conn.execute(
+            "INSERT INTO snapshots(version, source, state, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (version, source, json.dumps(state, ensure_ascii=False), created_at))
+
+    def replace_snapshots(self, snapshots: list[dict]):
+        """用迁移包内快照整体替换快照表（保留各快照原版本号与原时间戳）。
+
+        快照一经写入即不可改、不可删；导入允许替换的只有目标工作站的空白
+        基线快照。须在事务内调用。
+        """
+        self.conn.execute("DELETE FROM snapshots")
+        for s in snapshots:
+            self.save_snapshot_at(s["version"], s["source"], s["state"],
+                                  s["created_at"])
 
     def get_snapshot_state(self, version: int) -> dict | None:
         row = self.conn.execute(

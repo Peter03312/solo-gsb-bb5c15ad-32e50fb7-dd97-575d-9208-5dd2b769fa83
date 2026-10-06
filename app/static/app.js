@@ -18,6 +18,8 @@ const S = {
   trial: { steps: [], rehearsal: null, busy: false },
   // 历史版本：versions 版本清单；view 只读查看的历史版；restore 恢复预览
   history: { versions: [], view: null, restore: null, busy: false },
+  // 离线工作站迁移：pv 导入预览结果（不落库）；err 整包拒绝原因；busy 请求中
+  transfer: { pv: null, err: null, busy: false, fileName: '', file: null },
   camInit: false,
 };
 
@@ -68,6 +70,7 @@ async function loadAssembly() {
   S.trial = { steps: [], rehearsal: null, busy: false };  // 刷新后旧试拼作废
   S.revise = null;                                        // 刷新后旧修订会话作废
   S.calibrate = null;                                     // 刷新后旧校准会话作废
+  S.transfer = { pv: null, err: null, busy: false, fileName: '', file: null };
   S.history.view = null;
   S.history.restore = null;
   $('#versionBadge').textContent = `版本 v${S.version}`;
@@ -160,10 +163,12 @@ async function confirmRestore() {
   }
 }
 
-// 画布上优先展示的覆盖装配：校准预览（蓝）> 恢复预览（蓝）> 只读历史版（紫）> 试拼预演（蓝）
+// 画布上优先展示的覆盖装配：校准预览（蓝）> 导入预览（蓝）> 恢复预览（蓝）> 只读历史版（紫）> 试拼预演（蓝）
 function overlayAssembly() {
   const c = S.calibrate;
   if (c && c.preview) return { kind: 'calibration', a: calibrationAssembly() };
+  const t = S.transfer;
+  if (t.pv) return { kind: 'transfer', a: t.pv.imported_assembly };
   const h = S.history;
   if (h.restore) return { kind: 'restore', a: h.restore.restored_assembly };
   if (h.view) return { kind: 'history', a: h.view.assembly };
@@ -498,7 +503,9 @@ function renderPanel() {
   if (S.mode === 'relate') drawMinis();
   if (S.mode === 'revise') drawRevisionMinis();
   $('#hint').textContent = {
-    view: S.calibrate && S.calibrate.preview
+    view: S.transfer.pv
+      ? `导入预览：蓝色为导入后的完整装配（当前 v${S.version} 数据未改变，不写库）· 侧栏核对包内碎片/有效及已撤销关系/版本数后确认 · 拖拽平移 · 滚轮缩放`
+      : S.calibrate && S.calibrate.preview
       ? `整体校准预览：锚点 #${S.calibrate.anchorId} 固定，蓝色为其余碎片调整后位姿（绿/红对应点通过/超限）· 未写库 · 侧栏核对前后位姿/逐关系误差/轮廓冲突后确认 · 拖拽平移 · 滚轮缩放`
       : S.calibrate
         ? `整体校准：已选锚点 #${S.calibrate.anchorId}（其位姿固定）· 点「请求预览」共同最小化组内误差 · 拖拽平移 · 滚轮缩放`
@@ -517,6 +524,7 @@ function renderPanel() {
 
 function viewPanelHTML() {
   // 历史版本只读查看 / 恢复预览：顶部横幅 + 覆盖装配卡片，当前数据不隐藏但不渲染操作
+  if (S.transfer.pv) return transferPreviewPanelHTML();
   if (S.history.restore) return restorePanelHTML();
   if (S.history.view) return historyViewPanelHTML();
 
@@ -553,7 +561,81 @@ function viewPanelHTML() {
     <h2>拼接关系（${active.length}）</h2>${relCards}
     ${undone ? `<h2>已撤销（${undone.length}）</h2>${undoneCards}` : ''}
     ${historyPanelHTML()}
-    ${trialPanelHTML()}`;
+    ${trialPanelHTML()}
+    ${transferPanelHTML()}`;
+}
+
+// ---------------------------------------------------------------- 离线工作站迁移面板
+function transferPanelHTML() {
+  const T = S.transfer;
+  return `
+    <h2>离线工作站迁移</h2>
+    <div class="small">把<b>当前装配及全部不可改版本快照</b>导出为带格式版本号
+      （v1.0）的 JSON 包，拷到另一台<b>空白工作站</b>导入：先预览（碎片、有效/
+      已撤销关系、版本数、导入后装配，不写库），确认时携带目标库当前版本，
+      在单一事务中保留原 ID、轮廓、位姿、标记、状态、时间戳与各快照原版本号，
+      不新增版本；目标库存在用户碎片/关系则整包拒绝。</div>
+    ${T.err ? `<div class="conflicts"><b>迁移包被整包拒绝，未写入任何数据：</b><ul>${T.err}</ul></div>` : ''}
+    <div class="row" style="margin:6px 0">
+      <button class="act primary" id="btnTransferExport">导出当前装配 JSON 包</button>
+      <button class="act" id="btnTransferPick">选择迁移包并预览…</button>
+      <input type="file" id="transferFile" accept="application/json,.json" hidden>
+    </div>
+    <div class="small">${T.fileName ? `已选择文件：${esc(T.fileName)}` : '未选择迁移包'}${T.busy ? ' · 校验中…' : ''}</div>`;
+}
+
+function transferFragCards(a) {
+  return a.fragments.map(f => `
+    <div class="card">
+      <div class="row">
+        <span><span class="dot" style="background:${groupColor(f.group_id)}"></span><b>#${f.id} ${esc(f.name)}</b></span>
+      </div>
+      <div class="sub">${f.group_id == null ? '独立碎片' : `拼接组 G${f.group_id}`} ·
+        位置 (${fmt(f.x)}, ${fmt(f.y)}) mm · 角度 ${deg(f.theta)}° · ${f.contour.length} 顶点</div>
+    </div>`).join('');
+}
+
+function transferPreviewPanelHTML() {
+  const pv = S.transfer.pv;
+  const p = pv.package;
+  const a = pv.imported_assembly;
+  const stale = pv.target.current_version !== S.version;
+  const verRows = p.versions.map(v => `
+    <tr><td>v${v.version}</td><td>${esc(v.source_label || sourceLabel(v.source))}</td>
+        <td>${v.created_at.replace('T', ' ').slice(0, 19)}</td></tr>`).join('');
+  const relRows = pv.package.relations.map(r => `
+    <tr><td>#${r.id}</td><td>#${r.fragment_a} ↔ #${r.fragment_b}</td>
+        <td class="${r.active ? 'oktxt' : ''}">${r.active ? '有效' : '已撤销'}</td>
+        <td>${(r.created_at || '').replace('T', ' ').slice(0, 19)}</td>
+        <td>${(r.undone_at || '').replace('T', ' ').slice(0, 19)}</td></tr>`).join('');
+  return `
+    <div class="okbox hist-banner">📦 导入预览（格式 v${esc(pv.format_version)}${pv.exported_at ? `，导出于 ${esc(pv.exported_at.replace('T', ' ').slice(0, 19))}` : ''}）：
+      包内当前版本 <b>v${p.current_version}</b>，导入后目标库装配即为该版
+      （<b>不新增版本、不产生新快照</b>）。预览<b>不写库</b>，主画布蓝色为导入后装配。</div>
+    ${stale ? `<div class="conflicts">预览依据的目标库版本 v${pv.target.current_version}
+       已过期（当前 v${S.version}），请重新选择迁移包预览；此预览不可确认。</div>` : ''}
+    <div class="row" style="margin:6px 0">
+      <button class="act" id="btnTransferBack">返回当前装配</button>
+      <button class="act primary" id="btnTransferConfirm"
+        ${stale || S.transfer.busy ? 'disabled' : ''}>确认导入（替换空白基线，版本 → v${p.current_version}）</button>
+    </div>
+    <h2>包内容</h2>
+    <div class="small">碎片 <b>${p.fragment_count}</b> 片 · 关系 <b>${p.relation_count}</b> 条
+      （有效 ${p.active_relation_count} · 已撤销 ${p.undone_relation_count}）·
+      不可改快照 <b>${p.snapshot_count}</b> 条</div>
+    <table class="info">
+      <tr><th>快照版本</th><th>来源</th><th>原固化时间</th></tr>${verRows}
+    </table>
+    <h2>包内碎片（${p.fragment_count}）</h2>
+    <table class="info"><tr><th>id</th><th>名称</th><th>轮廓顶点数</th></tr>
+      ${p.fragments.map(f => `<tr><td>#${f.id}</td><td>${esc(f.name)}</td><td>${f.contour_vertices}</td></tr>`).join('')}
+    </table>
+    <h2>包内关系（${p.relation_count}，含已撤销）</h2>
+    <table class="info">
+      <tr><th>id</th><th>碎片</th><th>状态</th><th>创建时间</th><th>撤销时间</th></tr>${relRows}
+    </table>
+    <h2>导入后连通组</h2><div class="small">${esc(groupText(a.groups))}</div>
+    <h2>导入后碎片（${a.fragments.length}）</h2>${transferFragCards(a)}`;
 }
 
 // ---------------------------------------------------------------- 锚点整体校准面板
@@ -990,6 +1072,21 @@ function bindPanelEvents() {
   const btnCalibClose = document.getElementById('btnCalibClose');
   if (btnCalibClose) btnCalibClose.onclick = closeCalibration;
 
+  const btnTransferExport = document.getElementById('btnTransferExport');
+  if (btnTransferExport) btnTransferExport.onclick = exportPackage;
+  const btnTransferPick = document.getElementById('btnTransferPick');
+  if (btnTransferPick) btnTransferPick.onclick = () => $('#transferFile').click();
+  const transferFile = document.getElementById('transferFile');
+  if (transferFile) transferFile.onchange = e => {
+    const file = e.target.files[0];
+    if (file) previewImport(file);
+    e.target.value = '';   // 允许再次选择同名文件
+  };
+  const btnTransferBack = document.getElementById('btnTransferBack');
+  if (btnTransferBack) btnTransferBack.onclick = closeTransfer;
+  const btnTransferConfirm = document.getElementById('btnTransferConfirm');
+  if (btnTransferConfirm) btnTransferConfirm.onclick = confirmImport;
+
   if (S.mode === 'draw') {
     $('#fragName').oninput = e => { S.draw.name = e.target.value; };
     $('#undoPt').onclick = () => { S.draw.points.pop(); renderPanel(); renderMain(); };
@@ -1282,6 +1379,100 @@ function closeCalibration() {
   renderPanel(); renderMain();
 }
 
+// ---------------------------------------------------------------- 离线工作站迁移
+function transferErrorHtml(detail) {
+  if (!detail) return '请求失败';
+  const lines = detail.errors && detail.errors.length
+    ? detail.errors.map(e => `<li><span class="mono">${esc(e.field || '包')}</span>：${esc(e.message)}</li>`).join('')
+    : `<li>${esc(detail.message || JSON.stringify(detail))}</li>`;
+  return lines;
+}
+
+async function exportPackage() {
+  try {
+    const res = await fetch('/api/transfer/export');
+    if (!res.ok) throw new Error('export failed');
+    const blob = await res.blob();
+    const disposition = res.headers.get('Content-Disposition') || '';
+    const m = disposition.match(/filename="?([^"]+)"?/);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : 'pottery-assembly.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+    setMessage('已导出迁移包（当前装配 + 全部不可改快照，格式 v1.0）');
+  } catch (err) {
+    setMessage('导出失败：' + err.message, 'err');
+  }
+}
+
+async function previewImport(file) {
+  let pkg;
+  try {
+    pkg = JSON.parse(await file.text());
+  } catch {
+    S.transfer = { pv: null, err: ['文件不是合法 JSON，整包拒绝'], busy: false, fileName: file.name };
+    renderPanel();
+    return;
+  }
+  const T = S.transfer;
+  T.busy = true; T.err = null; T.pv = null; T.fileName = file.name; T.file = file;
+  renderPanel();
+  try {
+    T.pv = await api('/api/transfer/import/preview', {
+      method: 'POST',
+      body: JSON.stringify({ package: pkg }),
+    });
+    setMessage('导入预览完成（未写库）：核对包内容与导入后装配，确认后才替换空白基线');
+  } catch (err) {
+    T.pv = null;
+    T.err = [transferErrorHtml(err.detail)];
+  } finally {
+    T.busy = false;
+    renderPanel(); renderMain();
+  }
+}
+
+async function confirmImport() {
+  const pv = S.transfer.pv;
+  if (!pv || pv.target.current_version !== S.version) return;
+  // 预览响应不回传整包；从已选文件重读，避免在浏览器中缓存大 JSON 之外的额外状态
+  const file = S.transfer.file;
+  if (!file) { setMessage('请重新选择迁移包后再确认', 'err'); return; }
+  let pkg;
+  try {
+    pkg = JSON.parse(await file.text());
+  } catch {
+    setMessage('迁移包文件读取失败，请重新选择', 'err');
+    return;
+  }
+  try {
+    const res = await api('/api/transfer/import/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ package: pkg, expected_version: S.version }),
+    });
+    setMessage(`导入完成：装配 v${res.imported_version}，碎片 ${res.fragment_count} 片、关系 ${res.relation_count} 条、快照 ${res.snapshot_count} 条（原 ID/状态/时间戳保留）`);
+    S.transfer = { pv: null, err: null, busy: false, fileName: '', file: null };
+    applyAssembly(res.assembly);
+  } catch (err) {
+    if (err.status === 409) {
+      S.transfer.pv = null; S.transfer.file = null;
+      return handleConflict(err);
+    }
+    S.transfer.pv = null;
+    S.transfer.err = [transferErrorHtml(err.detail)];
+    renderPanel();
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+function closeTransfer() {
+  S.transfer = { pv: null, err: null, busy: false, fileName: '', file: null };
+  renderPanel(); renderMain();
+}
+
 function applyAssembly(a) {
   S.version = a.version;
   S.fragments = a.fragments;
@@ -1290,6 +1481,7 @@ function applyAssembly(a) {
   S.history.view = null;
   S.history.restore = null;
   S.calibrate = null;
+  S.transfer = { pv: null, err: null, busy: false, fileName: '', file: null };
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel(); renderMain();
   loadVersions();
@@ -1460,7 +1652,10 @@ canvas.addEventListener('wheel', e => {
 // ---------------------------------------------------------------- 模式切换
 function switchMode(mode) {
   if (S.mode === 'revise' && mode !== 'revise') S.revise = null;  // 离开修订页即结束会话
-  if (S.mode === 'view' && mode !== 'view') S.calibrate = null;   // 离开查看页即结束校准会话
+  if (S.mode === 'view' && mode !== 'view') {
+    S.calibrate = null;   // 离开查看页即结束校准会话
+    S.transfer = { pv: null, err: null, busy: false, fileName: '', file: null };
+  }
   if (mode !== 'view') { S.history.view = null; S.history.restore = null; }
   S.mode = mode;
   document.querySelectorAll('.mode-btn').forEach(b =>
