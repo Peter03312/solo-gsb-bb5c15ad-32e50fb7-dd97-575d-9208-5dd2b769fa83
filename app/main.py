@@ -36,21 +36,33 @@
   排序；只读，不因计算改变位姿、关系或历史，也不产生新快照。缺少陶片、
   重复陶片对、跨版本或无效编号时整次拒绝并指出字段。间隙为 0 表示接触，
   负值（-1）仅标识内部重叠，不得当作可用间隙（详见 gaps.py）。
+- 离线工作站迁移（/api/transfer/export、/api/transfer/import/preview|
+  confirm）：导出当前装配及全部不可改快照为带格式版本号的 JSON 包
+  （只读）；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配
+  （不写库），确认须携带目标库当前装配版本，在单一事务内保留碎片/关系
+  原 ID、轮廓、位姿、标记、状态、时间戳及各快照原版本号（导入不新增版本
+  与快照）；目标库仅允许无碎片无关系的空白基线，该基线由包整包替换。
+  格式版本不支持、轮廓无效、关系引用缺失、快照版本重复/缺号、末版与包内
+  当前装配不一致均整包拒绝并列出原因；目标版本过期 409，库与历史原状
+  （详见 portable.py、DB.import_package）。
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Literal, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, gaps, geometry, history, revision, trial
+from . import calibration, gaps, geometry, history, portable, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
+from .portable import PackageError
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
 
@@ -146,6 +158,16 @@ class GapPairIn(BaseModel):
 class GapsIn(BaseModel):
     # 非空陶片对列表；空列表整次拒绝（400 empty_pairs）
     pairs: list[GapPairIn] = Field(default_factory=list)
+
+
+class TransferPreviewIn(BaseModel):
+    # 迁移包整体（带 format / format_version 的 JSON 对象）
+    package: dict
+
+
+class TransferConfirmIn(TransferPreviewIn):
+    # 目标库当前装配版本；过期（他人已变更目标库）→ 409，库与历史保持原状
+    expected_version: int
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -828,6 +850,97 @@ def confirm_restore(version: int, payload: RestoreIn):
         "expected_version": payload.expected_version,
         "version": new_version,
         "assembly": restored,
+    }
+
+
+# ---------------------------------------------------------------- 离线工作站迁移
+
+def _validate_package(raw: dict) -> dict:
+    """整包校验；不通过按主原因抛 400（detail 含全部拒绝原因）。"""
+    try:
+        return portable.validate_package(raw)
+    except PackageError as e:
+        raise HTTPException(e.status, e.detail())
+
+
+@app.get("/api/transfer/export")
+def export_package(download: bool = False):
+    """导出当前装配及全部不可改版本快照为带格式版本号的 JSON 包。
+
+    只读：不改当前数据、不产生新快照。download=true 时以附件下载
+    （文件名含导出时间与当前版本），否则直接返回 JSON。
+    """
+    d = get_db()
+    with d.lock:
+        exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        pkg = portable.build_package(d, exported_at)
+    body = json.dumps(pkg, ensure_ascii=False, indent=2).encode("utf-8")
+    if download:
+        stamp = exported_at.replace(":", "-")
+        fname = f"pottery-assembly-v{pkg['current_version']}-{stamp}.json"
+        return Response(
+            content=body, media_type="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{fname}"'})
+    return Response(content=body, media_type="application/json")
+
+
+@app.post("/api/transfer/import/preview")
+def preview_import(payload: TransferPreviewIn):
+    """导入预览（不写库）：包内碎片、有效及已撤销关系、版本数与导入后装配。
+
+    包格式 / 轮廓 / 关系引用 / 快照版本 / 末版一致性问题 → 400，detail
+    含 code 与全部 reasons；目标库不是空白基线时 HTTP 200 但 ok=false
+    （确认按钮禁用，确认端点同样整次拒绝）。
+    """
+    d = get_db()
+    pkg = _validate_package(payload.package)
+    with d.lock:
+        _is_blank, target = portable.target_is_blank(d)
+    return portable.build_import_preview(pkg, target)
+
+
+@app.post("/api/transfer/import/confirm", status_code=201)
+def confirm_import(payload: TransferConfirmIn):
+    """确认导入：单一事务内把整包写入空白目标库。
+
+    - 携带目标库当前装配版本 expected_version；过期 → 409，库与历史原状；
+    - 目标库仅允许存在空白基线（无用户碎片 / 关系，基线快照也为空），
+      该基线由导入包整包替换；非空白 → 400 target_not_blank；
+    - 保留碎片 / 关系原 ID、轮廓、位姿、标记、状态（active/undone_at/
+      created_at）及全部快照原版本号、来源与快照时间戳；导入不产生新
+      版本号、不新增快照，装配版本置为包内 current_version；
+    - 包本身格式版本不支持 / 轮廓无效 / 关系引用缺失 / 快照版本重复 /
+      末版与包内当前装配不一致 → 400 整包拒绝并指出原因。
+    """
+    d = get_db()
+    pkg = _validate_package(payload.package)
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            is_blank, target = portable.target_is_blank(d)
+            if not is_blank:
+                raise HTTPException(400, detail={
+                    "message": "目标库不是空白工作站，整包拒绝，库与历史保持原状",
+                    "code": "target_not_blank",
+                    "target": target,
+                })
+            d.import_package(pkg)
+            d.recompute_groups()
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，导入未生效，库与历史保持原状")
+    return {
+        "ok": True,
+        "imported_version": pkg["current_version"],
+        "snapshot_count": len(pkg["snapshots"]),
+        "expected_version": payload.expected_version,
+        "assembly": d.assembly_state(),
     }
 
 

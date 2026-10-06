@@ -333,3 +333,61 @@ class DB:
             else:
                 self.conn.execute(
                     "DELETE FROM sqlite_sequence WHERE name = ?", (table,))
+
+    def import_package(self, pkg: dict):
+        """把迁移包整体写入**空白**目标库（须先通过 portable.validate_package
+        与空白基线校验，并在单事务内调用）。
+
+        - 碎片 / 关系保留包内原 ID 与原状态：轮廓、位姿、标记、max_error、
+          active、created_at、undone_at 全部按包原样写回；
+        - 全部不可改快照以**原版本号**、原 source、原 created_at、原 state
+          覆盖写回（目标库原有的空白基线被整包替换）；
+        - meta.version 直接置为包内 current_version（导入不产生新版本、
+          不递增装配版本，导入后历史查看 / 恢复 / 拼接仍基于原版本号）；
+        - 不重置任何时间戳；调用方随后须 recompute_groups() 重算连通组。
+        """
+        asm = pkg["current_assembly"]
+        snap_frags = {int(f["id"]): f for f in asm["fragments"]}
+        snap_rels = {int(r["id"]): r for r in asm["relations"]}
+        self.conn.execute("DELETE FROM snapshots")
+        self.conn.execute("DELETE FROM fragments")
+        self.conn.execute("DELETE FROM relations")
+        for fid in sorted(snap_frags):
+            f = snap_frags[fid]
+            self.conn.execute(
+                "INSERT INTO fragments(id, name, contour, x, y, theta,"
+                " group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (fid, f["name"], json.dumps(f["contour"], ensure_ascii=False),
+                 f["x"], f["y"], f["theta"], None, f["created_at"]))
+        for rid in sorted(snap_rels):
+            r = snap_rels[rid]
+            self.conn.execute(
+                "INSERT INTO relations(id, fragment_a, fragment_b, markers_a,"
+                " markers_b, max_error, active, created_at, undone_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rid, r["fragment_a"], r["fragment_b"],
+                 json.dumps(r["markers_a"], ensure_ascii=False),
+                 json.dumps(r["markers_b"], ensure_ascii=False),
+                 r["max_error"], 1 if r["active"] else 0,
+                 r["created_at"], r["undone_at"]))
+        for s in pkg["snapshots"]:
+            self.conn.execute(
+                "INSERT INTO snapshots(version, source, state, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (s["version"], s["source"],
+                 json.dumps(s["state"], ensure_ascii=False), s["created_at"]))
+        self.conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'version'",
+            (str(pkg["current_version"]),))
+        for table, ids in (("fragments", snap_frags), ("relations", snap_rels)):
+            if ids:
+                cur = self.conn.execute(
+                    "UPDATE sqlite_sequence SET seq = ? WHERE name = ?",
+                    (max(ids), table))
+                if cur.rowcount == 0:
+                    self.conn.execute(
+                        "INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
+                        (table, max(ids)))
+            else:
+                self.conn.execute(
+                    "DELETE FROM sqlite_sequence WHERE name = ?", (table,))
