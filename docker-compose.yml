@@ -1,0 +1,15 @@
+services:
+  pottery:
+    build: .
+    container_name: pottery-joiner
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /app/data/app.db   # SQLite 数据库文件路径
+      SEED_DEMO_DATA: "1"               # 首次启动写入演示陶片（0 关闭）
+    volumes:
+      - pottery-data:/app/data          # 持久化数据
+    restart: unless-stopped
+
+volumes:
+  pottery-data:

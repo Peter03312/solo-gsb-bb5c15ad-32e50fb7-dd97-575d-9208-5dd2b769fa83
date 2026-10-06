@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>陶片拼接系统</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>🏺 陶片拼接系统</h1>
+  <span id="versionBadge" class="badge">版本 v0</span>
+  <nav>
+    <button class="mode-btn active" data-mode="view">查看装配</button>
+    <button class="mode-btn" data-mode="draw">录入碎片</button>
+    <button class="mode-btn" data-mode="relate">新建拼接</button>
+  </nav>
+  <span id="message"></span>
+</header>
+<main>
+  <aside id="panel"></aside>
+  <section id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="hint"></div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
